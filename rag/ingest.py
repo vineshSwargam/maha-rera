@@ -11,7 +11,12 @@ import fitz
 import re
 import pandas as pd
 import random
-import re
+
+import unicodedata
+import subprocess
+import tempfile
+import cv2
+import numpy as np
 
 
 pdf_path = "data/human-nutrition-text.pdf"
@@ -55,14 +60,23 @@ def fix_private_use_chars(text: str) -> str:
         for c in text
     )
 
+def text_quality(text: str) -> float:
+    """Fraction of non-space characters that are real, readable text (0.0–1.0)."""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    def is_clean(c: str) -> bool:
+        cat = unicodedata.category(c)
+        if cat.startswith("C"):                      # control / private-use / unassigned
+            return False
+        if cat.startswith("L") and ord(c) > 0x24F:   # letters outside Latin (Greek/Coptic junk)
+            return False
+        return True
+    return sum(is_clean(c) for c in chars) / len(chars)
 
-def looks_like_drawing(text: str) -> bool:
-    words = text.split()
-    if len(words) < 30:
-        return False
-    short_caps = sum(1 for w in words if len(w) <= 4 and w.isupper())
-    unique_ratio = len(set(words)) / len(words)
-    return short_caps / len(words) > 0.4 or unique_ratio < 0.3
+
+def needs_ocr(text: str, min_chars: int = 50, min_quality: float = 0.98) -> bool:
+    return len(text.strip()) < min_chars or text_quality(text) < min_quality
 
 
 def ocr_page(page) -> str:
@@ -75,26 +89,88 @@ def ocr_page(page) -> str:
         print(f"[OCR failed on page {page.number}]: {e}")
         return ""
 
+def clean_ocr_text(text: str, min_alpha: int = 3, min_alpha_ratio: float = 0.5) -> str:
+    """Drop OCR noise lines (|, TTT, ===) and repeated labels; keep lines with real words."""
+    kept, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        letters = sum(c.isalpha() for c in line)
+        if letters < min_alpha:
+            continue
+        if letters / max(len(line.replace(" ", "")), 1) < min_alpha_ratio:
+            continue
+        if not re.search(r"[A-Za-z]{3,}", line):
+            continue
+        if line.lower() in seen:
+            continue
+        seen.add(line.lower())
+        kept.append(line)
+    return "\n".join(kept)
 
 
-def summarize_drawing(text: str, source: str) -> str:
-    # Turn floor-plan label soup into a short, searchable description
 
-    words = text.split()
+def _line_positions(mask, axis: int, min_frac: float) -> list[int]:
+    """Centres of long horizontal (axis=1) or vertical (axis=0) lines."""
+    proj = mask.sum(axis=axis) / 255
+    idx = np.where(proj > mask.shape[axis] * min_frac)[0]
+    if len(idx) == 0:
+        return []
+    out, start, prev = [], idx[0], idx[0]
+    for x in idx[1:]:
+        if x - prev > 20:
+            out.append((start + prev) // 2)
+            start = x
+        prev = x
+    out.append((start + prev) // 2)
+    return out
 
-    # Title-block style phrases: runs of 3+ words that aren't all short abbreviations
-    phrases = re.findall(r"(?:[A-Za-z&().,'-]{3,}\s+){2,}[A-Za-z&().,'-]{3,}", text)
-    title_block = " · ".join(dict.fromkeys(p.strip() for p in phrases))  # dedupe, keep order
 
-    # Most common labels (LOBBY, CAR LIFT, RAMP...), ignoring 1–2 letter codes and numbers
-    labels = [w for w in words if len(w) >= 3 and w.isalpha()]
-    top_labels = ", ".join(w for w, _ in Counter(labels).most_common(15))
+def _ocr_cell(img, psm: int) -> str:
+    if img.size == 0 or img.shape[0] < 8 or img.shape[1] < 8:
+        return ""
+    if (img < 128).mean() < 0.005:      # under 0.5% dark pixels → empty cell
+        return ""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        cv2.imwrite(f.name, img)
+        path = f.name
+    text = subprocess.run(["tesseract", path, "-", "--psm", str(psm)],
+                          capture_output=True, text=True).stdout
+    os.remove(path)
+    return " ".join(text.split()).strip("| ")
 
-    return (
-        f"Architectural drawing from {source}. "
-        f"Title block: {title_block[:1000]}. "
-        f"Labels on drawing: {top_labels}."
-    )
+
+def extract_tables(page, dpi: int = 300) -> list[list[str]] | None:
+    """Read a ruled table from a page. Returns rows of cell strings, or None if no grid."""
+    pix = page.get_pixmap(dpi=dpi)
+    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+    horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1)))
+    vert = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40)))
+
+    rows = _line_positions(horiz, axis=1, min_frac=0.3)
+    if len(rows) < 3:
+        return None
+    # Look for column lines only between the table's top and bottom edges
+    cols = _line_positions(vert[rows[0]:rows[-1], :], axis=0, min_frac=0.25)
+    if len(cols) < 3:
+        return None
+
+    if (len(rows) - 1) * (len(cols) - 1) > 400:   # drawings, not tables
+        return None
+
+    clean = cv2.bitwise_not(cv2.subtract(bw, cv2.bitwise_or(horiz, vert)))
+    pad = 6
+    table = []
+    for i in range(len(rows) - 1):
+        psm = 6 if i == 0 else 7
+        table.append([
+            _ocr_cell(clean[rows[i] + pad:rows[i + 1] - pad, cols[j] + pad:cols[j + 1] - pad], psm)
+            for j in range(len(cols) - 1)
+        ])
+    return table
+
 
 
 def get_page_text(page, source: str, page_number: int):
@@ -106,15 +182,13 @@ def get_page_text(page, source: str, page_number: int):
     print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
     print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
 
-    if looks_like_drawing(text):
-        print(f'DRAWING PAGE - {source} - Pg {page_number}')
-        text = summarize_drawing(text, source=source)   # title block + key labels
-        print('DRAWING SUMMARISED')
-        print(text)
-    elif len(text.strip()) < 50:
-        print(f'OCR PAGE - {source} - Pg {page_number}')
-        text = ocr_page(page) # scanned pages
-        print(text)
+    if not needs_ocr(text):
+        return {"text": text, "method": "text-layer", "table": None}
+
+    print(f"OCR: {source} p{page_number + 1}")
+    table = extract_tables(page)                 # None if the page has no grid
+    text = clean_ocr_text(ocr_page(page))
+    return {"text": text, "method": "ocr", "table": table}
     
     print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
     print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
@@ -131,18 +205,27 @@ def open_and_read_pdf(pdf_path: str, page_number_offset: int) -> list[dict]:
     print('======== NEW PAGE ======================================================================')
     # print('==============================================================================')
     doc = fitz.open(pdf_path)
+    source = os.path.basename(pdf_path)
+    os.makedirs("tables", exist_ok=True)
     pages_and_texts = []
     for page_number, page in tqdm(enumerate(doc)):
-        text = get_page_text(page, pdf_path, page_number)
-        text = text_formatter(text);
+        result = get_page_text(page, source, page_number)
+        text = text_formatter(result["text"])
+
+        if result["table"]:
+            pd.DataFrame(result["table"]).to_csv(
+                f"tables/{Path(pdf_path).stem}_p{page_number + 1}.csv", index=False, header=False
+            )
 
         pages_and_texts.append({
+            "source": source,
+            "method": result["method"],
             "page_number": page_number - page_number_offset,
             "page_char_count": len(text),
             "page_word_count": len(text.split(" ")),
             "page_sentence_count_raw": len(text.split(".")),
-            "page_token_count": len(text)/4, # assuming 4 chars is one token
-            "text": text
+            "page_token_count": len(text) / 4,
+            "text": text,
         })
     
 
@@ -163,7 +246,15 @@ def open_and_read_pdf(pdf_path: str, page_number_offset: int) -> list[dict]:
 
 def load_folder(folder: str) -> list[dict]:
     all_pages = []
-    for pdf_path in tqdm(sorted(Path(folder).glob("*.pdf"))[:25]):
+
+    # for pdf_path in tqdm(sorted(Path(folder).glob("*.pdf"))[15:25]):
+    for pdf_path in tqdm((Path(folder).glob("*.pdf"))):
+        print('paths -', str(pdf_path))
+
+    for pdf_path in tqdm((Path(folder).glob("*.pdf"))):
+        if not 'sold' in str(pdf_path).lower():
+            continue
+
         print('                                                                                         ')
         print('                                                                                         ')
         print('                                                                                         ')
@@ -172,8 +263,6 @@ def load_folder(folder: str) -> list[dict]:
         print('====================================================================================')
         print(f'Source: {pdf_path.name}')
         pages = open_and_read_pdf(str(pdf_path), page_number_offset=0)
-        for page in tqdm(pages):
-            page["source"] = pdf_path.name     # keep the filename with every page
         all_pages.extend(pages)
         print('====================================================================================')
         print('====================================================================================')
