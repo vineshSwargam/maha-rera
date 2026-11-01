@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 import cv2
 import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 pdf_path = "data/human-nutrition-text.pdf"
@@ -138,6 +140,30 @@ def _ocr_cell(img, psm: int) -> str:
     os.remove(path)
     return " ".join(text.split()).strip("| ")
 
+def extract_table_single_thread(clean, rows, cols):
+    pad = 6
+    table = []
+    for i in range(len(rows) - 1):
+        psm = 6 if i == 0 else 7
+        table.append([
+            _ocr_cell(clean[rows[i] + pad:rows[i + 1] - pad, cols[j] + pad:cols[j + 1] - pad], psm)
+            for j in range(len(cols) - 1)
+        ])
+    return table
+
+def extract_table_with_concurrency(clean, rows, cols):
+    pad = 6
+    jobs = [
+        (clean[rows[i] + pad:rows[i + 1] - pad, cols[j] + pad:cols[j + 1] - pad], 6 if i == 0 else 7)
+        for i in range(len(rows) - 1)
+        for j in range(len(cols) - 1)
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        texts = list(pool.map(lambda job: _ocr_cell(*job), jobs))
+
+    n_cols = len(cols) - 1
+    return [texts[k:k + n_cols] for k in range(0, len(texts), n_cols)]
 
 def extract_tables(page, dpi: int = 300) -> list[list[str]] | None:
     """Read a ruled table from a page. Returns rows of cell strings, or None if no grid."""
@@ -161,15 +187,9 @@ def extract_tables(page, dpi: int = 300) -> list[list[str]] | None:
         return None
 
     clean = cv2.bitwise_not(cv2.subtract(bw, cv2.bitwise_or(horiz, vert)))
-    pad = 6
-    table = []
-    for i in range(len(rows) - 1):
-        psm = 6 if i == 0 else 7
-        table.append([
-            _ocr_cell(clean[rows[i] + pad:rows[i + 1] - pad, cols[j] + pad:cols[j + 1] - pad], psm)
-            for j in range(len(cols) - 1)
-        ])
-    return table
+    
+    # with concurrency
+    return extract_table_with_concurrency(clean, rows, cols)
 
 
 
