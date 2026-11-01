@@ -33,7 +33,7 @@ def print_embeddings(chunk_pages):
     # pprint(embedded_chunks_df.head())
     # pprint(embedded_chunks_df.describe())
 
-def _build_embeddings():
+def build_embeddings():
     download_document(url, pdf_path)
     page_number_offset = 41
     pages = open_and_read_pdf(pdf_path, page_number_offset)
@@ -57,27 +57,14 @@ def _build_embeddings():
     # view_embeddings(pd, EMBEDDINGS_PATH)
 
 
-def build_embeddings():
-    load_folder('./birlaNiyara')
-    # pages = load_folder('./birlaNiyara')
+def build_birla_embeddings():
+    pages = load_folder('./birlaNiyara')
+    print(f"Read {len(pages)} pages")
+    pages = process_sentences(pages)
+    chunk_pages = split_pages_into_chunks(pages, 10)
+    chunk_pages = filter_short_chunks(chunk_pages, "chunk_token_count", 30)
+    save_embeddings(pd, chunk_pages, "sentence_chunk", "embedding", EMBEDDINGS_PATH)
 
-    # print(f"Read {len(pages)} pages")
-    # print(pages[50])  # look at one page to sanity-check
-    # pages = process_sentences(pages);
-    # pprint(pages[50]);
-
-
-    # More than 25% of pages are above 384 tokens limitation of our embedding model
-    # sentence-transformers all-mpnet-base-v2, see: https://www.sbert.net/docs/pretrained_models.html
-    # lets split it
-    # chunk_size = 10
-
-    # chunk_pages = split_pages_into_chunks(pages, chunk_size)
-    # chunk_pages = filter_short_chunks(chunk_pages, "chunk_token_count", 30)
-    # #  print_embeddings(chunk_pages)
-
-    # embedded_chunks = save_embeddings(pd, chunk_pages, "sentence_chunk", "embedding", EMBEDDINGS_PATH)
-    # view_embeddings(pd, EMBEDDINGS_PATH)
 
 queries = [
     'good foods for protein',
@@ -93,7 +80,7 @@ def main():
 
     if not os.path.exists(EMBEDDINGS_PATH):
         print('No saved embeddings, building them..')
-        build_embeddings()
+        build_birla_embeddings()
 
     retrieved_embeddings = retrieve_embeddings_for_search(pd, EMBEDDINGS_PATH, 'embedding')
     embeddings = retrieved_embeddings['embeddings']
@@ -102,6 +89,11 @@ def main():
     llm = init_model(
         use_quantization_config = False,
     )
+
+    should_start_chat = False
+
+    if not should_start_chat:
+        return
 
     def retrieve_and_answer():
         count_of_resources_to_retrieve = 5
@@ -128,7 +120,6 @@ def main():
         )
         
         # print(f"\n{answer}")
-
 
     while True:
         query = input("\nAsk me a nutrition question (or 'q' to quit): ").strip()
